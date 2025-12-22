@@ -17,6 +17,7 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
+import tempfile
 import stat
 import sys
 import tarfile
@@ -36,6 +37,7 @@ from click.core import Context
 from click.types import ParamType
 from firecrest import ClientCredentialsAuth
 from firecrest.v2 import AsyncFirecrest, Firecrest
+from firecrest.FirecrestException import UnexpectedStatusException
 from packaging.version import InvalidVersion, Version, parse
 
 from aiida_firecrest.utils import FcPath, TPath_Extended, convert_header_exceptions
@@ -685,13 +687,71 @@ class FirecrestTransport(AsyncTransport):  # type: ignore[misc]
         # remotesource and remotedestination are non descriptive names.
         # We use those only because the functions signature should be the same as the one in superclass
 
-        link_path = str(remotedestination)
+        link_path = FcPath(remotedestination)
         source_path = str(remotesource)
 
         if not PurePosixPath(source_path).is_absolute():
             raise ValueError("target(remotesource) must be an absolute path")
-        with convert_header_exceptions():
-            await self.async_client.symlink(self._machine, source_path, link_path)
+        if not PurePosixPath(str(link_path)).is_absolute():
+            raise ValueError("link(remotedestination) must be an absolute path")
+
+        try:
+            with convert_header_exceptions():
+                await self.async_client.symlink(
+                    self._machine, source_path, str(link_path)
+                )
+            return
+        except (FileNotFoundError, UnexpectedStatusException) as exc:
+            # FirecREST checks that the symlink target exists; fall back to a creation
+            # path that tolerates missing targets (matching SSH behaviour).
+            # Handle both FileNotFoundError and 404 responses from symlink validation
+            if isinstance(exc, UnexpectedStatusException):
+                # Only use fallback for 404 errors (target doesn't exist)
+                if "404" not in str(exc):
+                    raise
+            if not await self.path_exists_async(link_path.parent):
+                raise
+            # Check if symlink already exists
+            try:
+                existing_stat = await self._lstat(link_path)
+                if stat.S_ISLNK(existing_stat.st_mode):
+                    # It's a symlink - assume it's correct from a retry, skip creation
+                    return
+                else:
+                    # Not a symlink, it's a file or directory - error
+                    raise FileExistsError(f"'{link_path}' already exists and is not a symlink")
+            except FileNotFoundError:
+                # Doesn't exist yet, proceed with creation
+                pass
+
+        await self._create_symlink_archive(source_path, link_path)
+
+    async def _create_symlink_archive(
+        self, source_path: str, link_path: FcPath
+    ) -> None:
+        """Create a symlink without validating the target by extracting an archive."""
+
+        _ = uuid.uuid4()
+        remote_archive = self._temp_directory.joinpath(f"symlink_{_}.tar.gz")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_dir_path = Path(tmp_dir)
+            local_symlink = tmp_dir_path.joinpath(link_path.name)
+            os.symlink(source_path, local_symlink)
+
+            archive_path = tmp_dir_path.joinpath("symlink.tar.gz")
+            with tarfile.open(archive_path, "w:gz", dereference=False) as tar:
+                tar.add(local_symlink, arcname=link_path.name)
+
+            await self.putfile_async(archive_path, remote_archive)
+
+        try:
+            with convert_header_exceptions():
+                await self.async_client.extract(
+                    self._machine, str(remote_archive), str(link_path.parent)
+                )
+        finally:
+            await self.remove_async(remote_archive)
 
     async def copyfile_async(
         self,
@@ -762,8 +822,14 @@ class FirecrestTransport(AsyncTransport):  # type: ignore[misc]
             raise FileNotFoundError(f"Source file does not exist: {source}")
         if not (await self.isdir_async(source)):
             raise ValueError(f"Source is not a directory: {source}")
-        if not (await self.path_exists_async(destination)):
-            raise FileNotFoundError(f"Destination file does not exist: {destination}")
+
+        # Check that the parent directory of the destination exists, not the destination itself
+        # This aligns with standard SSH transport behavior and allows copying to new destinations
+        parent_directory = str(Path(destination).parent)
+        if not (await self.path_exists_async(parent_directory)):
+            raise FileNotFoundError(
+                f"Destination parent directory does not exist: {parent_directory}"
+            )
 
         await self._copy_to(source, destination, dereference)
 
