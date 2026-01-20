@@ -22,6 +22,7 @@ from aiida.schedulers.plugins.slurm import _TIME_REGEXP, SlurmJobResource
 from firecrest.FirecrestException import FirecrestException
 
 from aiida_firecrest.utils import FcPath, JobNotFoundError, convert_header_exceptions
+import time
 
 if TYPE_CHECKING:
     from aiida_firecrest.transport import FirecrestTransport
@@ -231,6 +232,7 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
             job_id: str | None = None,
         ) -> list[Any]:
             """Send a request to the Firecrest server and handle errors."""
+            time.sleep(2)
             try:
                 with convert_header_exceptions():
                     return transport.blocking_client.job_info(  # type: ignore[no-any-return]
@@ -243,6 +245,10 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
             except JobNotFoundError:
                 # If the job is not found, we just skip it
                 # this is to be consistent with aiida-firecrest-v1
+                self.logger.warning(
+                    f"The following Job ids {job_id} was not found in FirecREST queue."
+                    "This may result in premature retrival in aiida-core."
+                )
                 return []
 
         # If the job is completed, while aiida expect a silent return
@@ -362,7 +368,7 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
                 else:
                     this_job.requested_wallclock_time_seconds = time_limit
             except ValueError:
-                self.logger.warning(
+                self.logger.debug(
                     f"Couldn't parse the time limit for job id {this_job.job_id}"
                 )
 
@@ -376,7 +382,7 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
                     else:
                         this_job.wallclock_time_seconds = 0
                 except ValueError:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"Couldn't parse time_used for job id {this_job.job_id}"
                     )
 
@@ -389,7 +395,7 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
                         raw_result["time"]["start"]
                     )
                 except ValueError:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"Couldn't parse dispatch_time for job id {this_job.job_id}"
                     )
 
@@ -399,7 +405,7 @@ class FirecrestScheduler(Scheduler):  # type: ignore[misc]
                         raw_result["time"]["end"]
                     )
                 except ValueError:
-                    self.logger.warning(
+                    self.logger.debug(
                         f"Couldn't parse finish_time for job id {this_job.job_id}"
                     )
 
